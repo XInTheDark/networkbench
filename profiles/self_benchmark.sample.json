@@ -1,0 +1,80 @@
+{
+  "dns_hosts": [
+    "example.com",
+    "cloudflare.com",
+    "speed.cloudflare.com"
+  ],
+  "latency_targets": [
+    {
+      "name": "cloudflare_speed",
+      "host": "speed.cloudflare.com",
+      "port": 443,
+      "tls_sni": "speed.cloudflare.com"
+    },
+    {
+      "name": "cloudflare_www",
+      "host": "www.cloudflare.com",
+      "port": 443,
+      "tls_sni": "www.cloudflare.com"
+    },
+    {
+      "name": "dns_google",
+      "host": "dns.google",
+      "port": 443,
+      "tls_sni": "dns.google"
+    }
+  ],
+  "http_small_objects": [
+    {
+      "name": "homepage",
+      "url": "https://www.example.com/"
+    },
+    {
+      "name": "cloudflare_home",
+      "url": "https://www.cloudflare.com/"
+    }
+  ],
+  "http_bulk_downloads": [
+    {
+      "name": "cloudflare_download_25mb",
+      "url": "https://speed.cloudflare.com/__down?bytes=25000000",
+      "read_bytes": 25000000
+    },
+    {
+      "name": "cloudflare_download_100mb",
+      "url": "https://speed.cloudflare.com/__down?bytes=100000000",
+      "read_bytes": 100000000
+    }
+  ],
+  "http_uploads": [
+    {
+      "name": "cloudflare_upload_25mb",
+      "url": "https://speed.cloudflare.com/__up",
+      "method": "POST",
+      "bytes": 25000000,
+      "headers": {
+        "Content-Type": "application/octet-stream"
+      }
+    }
+  ],
+  "reliability_targets": [
+    {
+      "name": "speed_cloudflare_tls",
+      "kind": "tls",
+      "host": "speed.cloudflare.com",
+      "port": 443,
+      "tls_sni": "speed.cloudflare.com"
+    },
+    {
+      "name": "example_http",
+      "kind": "http",
+      "url": "https://www.example.com/"
+    },
+    {
+      "name": "cloudflare_tcp",
+      "kind": "tcp",
+      "host": "1.1.1.1",
+      "port": 443
+    }
+  ]
+}
