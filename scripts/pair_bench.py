@@ -15,6 +15,7 @@ from typing import Any
 
 from bench_common import (
     analysis_flags,
+    fmt_bytes,
     fmt_number,
     now_iso,
     summarize_boolean_results,
@@ -30,6 +31,43 @@ UDP_MAGIC = b"NBUD"
 RPC_HEADER = struct.Struct("!I")
 UDP_HEADER = struct.Struct("!4sIQ")
 BUFFER_SIZE = 64 * 1024
+
+
+def log_progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def log_test_start(name: str, detail: str | None = None) -> None:
+    suffix = f" ({detail})" if detail else ""
+    log_progress(f"[client] starting {name}{suffix}")
+
+
+def log_test_done(name: str, detail: str | None = None) -> None:
+    suffix = f": {detail}" if detail else ""
+    log_progress(f"[client] finished {name}{suffix}")
+
+
+def transfer_progress(prefix: str, elapsed_s: float, total_bytes: int) -> None:
+    mbps = (total_bytes * 8) / max(elapsed_s, 0.001) / 1_000_000
+    log_progress(
+        f"{prefix} progress {elapsed_s:.1f}s | {fmt_bytes(total_bytes)} transferred | avg {fmt_number(mbps)} Mbps"
+    )
+
+
+def summarize_transfer_brief(result: dict[str, Any]) -> str:
+    return (
+        f"{fmt_number(result.get('mbps'))} Mbps over {fmt_number(result.get('seconds'))}s "
+        f"({fmt_bytes(result.get('bytes'))})"
+    )
+
+
+def summarize_latency_brief(result: dict[str, Any], field: str = "latency_ms") -> str:
+    data = result[field]
+    return (
+        f"p50 {fmt_number(data.get('p50'))} ms, "
+        f"p95 {fmt_number(data.get('p95'))} ms, "
+        f"success {fmt_number(result.get('reliability', {}).get('success_rate', 1.0) * 100 if result.get('reliability') and result.get('reliability', {}).get('success_rate') is not None else None)}%"
+    )
 
 
 def send_json_line(conn: socket.socket, payload: dict[str, Any]) -> None:
@@ -262,9 +300,11 @@ def tcp_download_once(
     timeout: float,
     await_start: bool = False,
     start_event: threading.Event | None = None,
+    progress_label: str | None = None,
 ) -> dict[str, Any]:
     total_bytes = 0
     per_second: dict[int, int] = {}
+    last_logged_bucket = -1
     with socket.create_connection((host, port), timeout=timeout) as conn:
         conn.settimeout(timeout)
         send_json_line(
@@ -290,6 +330,10 @@ def tcp_download_once(
             total_bytes += len(chunk)
             idx = bucket_index(started, time.perf_counter_ns())
             per_second[idx] = per_second.get(idx, 0) + len(chunk)
+            if progress_label and idx > last_logged_bucket:
+                elapsed_s = max((time.perf_counter_ns() - started) / 1_000_000_000, 0.001)
+                transfer_progress(progress_label, elapsed_s, total_bytes)
+                last_logged_bucket = idx
         ended = time.perf_counter_ns()
     series = [per_second.get(idx, 0) for idx in range(max(per_second.keys(), default=-1) + 1)]
     return summarize_transfer(total_bytes, (ended - started) / 1_000_000_000, series)
@@ -302,10 +346,12 @@ def tcp_upload_once(
     timeout: float,
     await_start: bool = False,
     start_event: threading.Event | None = None,
+    progress_label: str | None = None,
 ) -> dict[str, Any]:
     total_bytes = 0
     per_second: dict[int, int] = {}
     payload = b"u" * BUFFER_SIZE
+    last_logged_bucket = -1
     with socket.create_connection((host, port), timeout=timeout) as conn:
         conn.settimeout(timeout)
         send_json_line(
@@ -325,6 +371,10 @@ def tcp_upload_once(
             total_bytes += sent
             idx = bucket_index(started, time.perf_counter_ns())
             per_second[idx] = per_second.get(idx, 0) + sent
+            if progress_label and idx > last_logged_bucket:
+                elapsed_s = max((time.perf_counter_ns() - started) / 1_000_000_000, 0.001)
+                transfer_progress(progress_label, elapsed_s, total_bytes)
+                last_logged_bucket = idx
         try:
             conn.shutdown(socket.SHUT_WR)
         except OSError:
@@ -342,6 +392,7 @@ def parallel_transfers(
     streams: int,
     direction: str,
 ) -> dict[str, Any]:
+    log_progress(f"[client] starting parallel {direction} test with {streams} streams for {seconds:.1f}s")
     start_event = threading.Event()
     results: list[dict[str, Any] | None] = [None] * streams
     errors: list[str] = []
@@ -384,13 +435,17 @@ def parallel_transfers(
 
     total_bytes = sum(item["bytes"] for item in results if item)
     wall_seconds = (wall_end - wall_start) / 1_000_000_000
-    return {
+    outcome = {
         "streams": streams,
         "direction": direction,
         "aggregate": summarize_transfer(total_bytes, wall_seconds),
         "per_stream": results,
         "errors": errors,
     }
+    log_progress(
+        f"[client] finished parallel {direction} test: {summarize_transfer_brief(outcome['aggregate'])}"
+    )
+    return outcome
 
 
 def start_background_download(
@@ -473,6 +528,9 @@ def udp_echo_test(
     pps: float,
     timeout: float,
 ) -> dict[str, Any]:
+    log_progress(
+        f"[client] starting UDP echo test: {count} packets, {packet_size} bytes, {fmt_number(pps)} pps"
+    )
     packet_size = max(packet_size, UDP_HEADER.size)
     send_times: dict[int, int] = {}
     received = set()
@@ -486,6 +544,7 @@ def udp_echo_test(
         sock.settimeout(socket_timeout)
         target = (host, port)
         started = time.perf_counter()
+        progress_step = max(1, count // 5)
         for seq in range(count):
             deadline = started + (seq / max(pps, 0.1))
             while True:
@@ -521,6 +580,10 @@ def udp_echo_test(
                 highest_seen = max(highest_seen, echoed_seq)
                 received.add(echoed_seq)
                 latencies.append((time.perf_counter_ns() - echoed_sent_ns) / 1_000_000)
+            if (seq + 1) % progress_step == 0 or seq + 1 == count:
+                log_progress(
+                    f"[client] UDP progress {seq + 1}/{count} sent | received {len(received)} | loss so far {seq + 1 - len(received)}"
+                )
 
         grace_deadline = time.perf_counter() + 1.0
         while time.perf_counter() < grace_deadline and len(received) < count:
@@ -548,7 +611,7 @@ def udp_echo_test(
         for idx in range(1, len(sorted_latencies))
     ]
     loss = count - len(received)
-    return {
+    outcome = {
         "packet_size": packet_size,
         "count": count,
         "pps": pps,
@@ -560,6 +623,11 @@ def udp_echo_test(
         "rtt_ms": summarize_samples(latencies),
         "jitter_ms": summarize_samples(jitter_samples),
     }
+    log_progress(
+        f"[client] finished UDP echo test: loss {fmt_number(outcome['loss_rate'] * 100 if outcome['loss_rate'] is not None else None)}%, "
+        f"rtt p95 {fmt_number(outcome['rtt_ms']['p95'])} ms"
+    )
+    return outcome
 
 
 def udp_size_sweep(
@@ -584,10 +652,13 @@ def soak_test(
     payload_size: int,
     timeout: float,
 ) -> dict[str, Any]:
+    log_progress(f"[client] starting soak test for {duration_s}s with {interval_s:.1f}s probes")
     latencies = []
     successes = []
     samples = []
     deadline = time.perf_counter() + duration_s
+    started = time.perf_counter()
+    next_progress = started + 5.0
     while time.perf_counter() < deadline:
         loop_start = time.perf_counter()
         try:
@@ -599,10 +670,16 @@ def soak_test(
         except Exception as exc:  # noqa: BLE001
             successes.append(False)
             samples.append({"ok": False, "error": str(exc)})
+        now = time.perf_counter()
+        if now >= next_progress:
+            log_progress(
+                f"[client] soak progress {int(now - started)}s/{duration_s}s | probes {len(samples)} | failures {sum(1 for item in successes if not item)}"
+            )
+            next_progress = now + 5.0
         remaining = interval_s - (time.perf_counter() - loop_start)
         if remaining > 0:
             time.sleep(remaining)
-    return {
+    outcome = {
         "duration_s": duration_s,
         "interval_s": interval_s,
         "payload_size": payload_size,
@@ -610,6 +687,11 @@ def soak_test(
         "reliability": summarize_boolean_results(successes),
         "samples": samples,
     }
+    log_progress(
+        f"[client] finished soak test: failures {outcome['reliability']['failures']}, "
+        f"latency p95 {fmt_number(outcome['latency_ms']['p95'])} ms"
+    )
+    return outcome
 
 
 def mixed_load_test(
@@ -624,6 +706,9 @@ def mixed_load_test(
     udp_count: int,
     udp_pps: float,
 ) -> dict[str, Any]:
+    log_progress(
+        f"[client] starting mixed-load test for {duration_s}s with {streams} background download and {streams} background upload streams"
+    )
     stop_event = threading.Event()
     download_counters = [0] * streams
     upload_counters = [0] * streams
@@ -654,7 +739,7 @@ def mixed_load_test(
     stop_event.set()
     for thread in threads:
         thread.join(timeout=2.0)
-    return {
+    outcome = {
         "duration_s": duration_s,
         "background_streams_each_direction": streams,
         "background_download_mbps": sum(download_counters) * 8 / max(duration_s, 1) / 1_000_000,
@@ -662,6 +747,12 @@ def mixed_load_test(
         "rpc_latency_ms": rpc_result["latency_ms"],
         "udp": udp_result,
     }
+    log_progress(
+        f"[client] finished mixed-load test: bg down {fmt_number(outcome['background_download_mbps'])} Mbps, "
+        f"bg up {fmt_number(outcome['background_upload_mbps'])} Mbps, "
+        f"RPC p95 {fmt_number(outcome['rpc_latency_ms']['p95'])} ms"
+    )
+    return outcome
 
 
 def profile_defaults(name: str) -> dict[str, Any]:
@@ -839,9 +930,13 @@ def run_client(args: argparse.Namespace) -> int:
         "tests": {},
     }
 
+    log_test_start("connect latency", f"{profile['connect_attempts']} attempts")
     results["tests"]["connect_latency"] = tcp_connect_latency(
         args.host, args.port, profile["connect_attempts"], args.timeout
     )
+    log_test_done("connect latency", summarize_latency_brief(results["tests"]["connect_latency"]))
+
+    log_test_start("idle RPC latency", f"{profile['rpc_iterations']} iterations")
     results["tests"]["rpc_idle"] = tcp_rpc_latency(
         args.host,
         args.port,
@@ -849,18 +944,33 @@ def run_client(args: argparse.Namespace) -> int:
         profile["rpc_payload_size"],
         args.timeout,
     )
+    log_test_done(
+        "idle RPC latency",
+        f"p50 {fmt_number(results['tests']['rpc_idle']['latency_ms']['p50'])} ms, "
+        f"p95 {fmt_number(results['tests']['rpc_idle']['latency_ms']['p95'])} ms",
+    )
+
+    log_test_start("single-stream download", f"{profile['transfer_seconds']}s")
     results["tests"]["tcp_download_single"] = tcp_download_once(
         args.host,
         args.port,
         profile["transfer_seconds"],
         args.timeout,
+        progress_label="[client] download",
     )
+    log_test_done("single-stream download", summarize_transfer_brief(results["tests"]["tcp_download_single"]))
+
+    log_test_start("single-stream upload", f"{profile['transfer_seconds']}s")
     results["tests"]["tcp_upload_single"] = tcp_upload_once(
         args.host,
         args.port,
         profile["transfer_seconds"],
         args.timeout,
+        progress_label="[client] upload",
     )
+    log_test_done("single-stream upload", summarize_transfer_brief(results["tests"]["tcp_upload_single"]))
+
+    log_test_start("parallel download", f"{profile['parallel_streams']} streams")
     results["tests"]["tcp_download_parallel"] = parallel_transfers(
         args.host,
         args.port,
@@ -869,6 +979,12 @@ def run_client(args: argparse.Namespace) -> int:
         profile["parallel_streams"],
         direction="download",
     )
+    log_test_done(
+        "parallel download",
+        summarize_transfer_brief(results["tests"]["tcp_download_parallel"]["aggregate"]),
+    )
+
+    log_test_start("parallel upload", f"{profile['parallel_streams']} streams")
     results["tests"]["tcp_upload_parallel"] = parallel_transfers(
         args.host,
         args.port,
@@ -877,6 +993,12 @@ def run_client(args: argparse.Namespace) -> int:
         profile["parallel_streams"],
         direction="upload",
     )
+    log_test_done(
+        "parallel upload",
+        summarize_transfer_brief(results["tests"]["tcp_upload_parallel"]["aggregate"]),
+    )
+
+    log_test_start("UDP idle test")
     results["tests"]["udp_idle"] = udp_echo_test(
         args.host,
         args.port,
@@ -885,6 +1007,13 @@ def run_client(args: argparse.Namespace) -> int:
         profile["udp_idle_pps"],
         args.timeout,
     )
+    log_test_done(
+        "UDP idle test",
+        f"loss {fmt_number(results['tests']['udp_idle']['loss_rate'] * 100 if results['tests']['udp_idle']['loss_rate'] is not None else None)}%, "
+        f"rtt p95 {fmt_number(results['tests']['udp_idle']['rtt_ms']['p95'])} ms",
+    )
+
+    log_test_start("UDP stress test")
     results["tests"]["udp_stress"] = udp_echo_test(
         args.host,
         args.port,
@@ -893,6 +1022,13 @@ def run_client(args: argparse.Namespace) -> int:
         profile["udp_stress_pps"],
         args.timeout,
     )
+    log_test_done(
+        "UDP stress test",
+        f"loss {fmt_number(results['tests']['udp_stress']['loss_rate'] * 100 if results['tests']['udp_stress']['loss_rate'] is not None else None)}%, "
+        f"rtt p95 {fmt_number(results['tests']['udp_stress']['rtt_ms']['p95'])} ms",
+    )
+
+    log_test_start("UDP size sweep", f"{len(profile['udp_sweep_sizes'])} packet sizes")
     results["tests"]["udp_size_sweep"] = udp_size_sweep(
         args.host,
         args.port,
@@ -901,6 +1037,9 @@ def run_client(args: argparse.Namespace) -> int:
         profile["udp_sweep_pps"],
         args.timeout,
     )
+    log_test_done("UDP size sweep", "completed all packet sizes")
+
+    log_test_start("mixed-load test", f"{profile['mixed_seconds']}s")
     results["tests"]["mixed_load"] = mixed_load_test(
         args.host,
         args.port,
@@ -913,6 +1052,13 @@ def run_client(args: argparse.Namespace) -> int:
         udp_count=max(80, profile["udp_idle_count"] // 2),
         udp_pps=profile["udp_idle_pps"],
     )
+    log_test_done(
+        "mixed-load test",
+        f"RPC p95 {fmt_number(results['tests']['mixed_load']['rpc_latency_ms']['p95'])} ms, "
+        f"bg down {fmt_number(results['tests']['mixed_load']['background_download_mbps'])} Mbps",
+    )
+
+    log_test_start("soak test", f"{profile['soak_seconds']}s")
     results["tests"]["soak"] = soak_test(
         args.host,
         args.port,
@@ -920,6 +1066,11 @@ def run_client(args: argparse.Namespace) -> int:
         interval_s=1.0,
         payload_size=profile["rpc_payload_size"],
         timeout=args.timeout,
+    )
+    log_test_done(
+        "soak test",
+        f"failures {results['tests']['soak']['reliability']['failures']}, "
+        f"p95 {fmt_number(results['tests']['soak']['latency_ms']['p95'])} ms",
     )
     results["analysis_flags"] = infer_flags(results)
 

@@ -187,3 +187,17 @@ def fmt_number(value: float | int | None, decimals: int = 2, fallback: str = "-"
     if value is None:
         return fallback
     return f"{value:.{decimals}f}"
+
+
+def fmt_bytes(value: int | float | None, fallback: str = "-") -> str:
+    if value is None:
+        return fallback
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    amount = float(value)
+    unit = units[0]
+    for unit in units:
+        if abs(amount) < 1024 or unit == units[-1]:
+            break
+        amount /= 1024.0
+    decimals = 0 if unit == "B" else 2
+    return f"{amount:.{decimals}f} {unit}"

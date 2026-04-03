@@ -21,6 +21,7 @@ from typing import Any
 
 from bench_common import (
     analysis_flags,
+    fmt_bytes,
     fmt_number,
     summarize_boolean_results,
     summarize_samples,
@@ -115,6 +116,27 @@ PROFILE_PRESETS = {
         "load_seconds": 20,
     },
 }
+
+
+def log_progress(message: str) -> None:
+    print(message, flush=True)
+
+
+def log_test_start(name: str, detail: str | None = None) -> None:
+    suffix = f" ({detail})" if detail else ""
+    log_progress(f"[self] starting {name}{suffix}")
+
+
+def log_test_done(name: str, detail: str | None = None) -> None:
+    suffix = f": {detail}" if detail else ""
+    log_progress(f"[self] finished {name}{suffix}")
+
+
+def transfer_progress(prefix: str, elapsed_s: float, total_bytes: int) -> None:
+    mbps = (total_bytes * 8) / max(elapsed_s, 0.001) / 1_000_000
+    log_progress(
+        f"{prefix} progress {elapsed_s:.1f}s | {fmt_bytes(total_bytes)} transferred | avg {fmt_number(mbps)} Mbps"
+    )
 
 
 def load_profile(path: str | None) -> dict[str, Any]:
@@ -400,6 +422,9 @@ def http_burst_test(
     concurrency: int,
     timeout: float,
 ) -> dict[str, Any]:
+    log_progress(
+        f"[self] burst test {target['name']}: {requests_count} requests at concurrency {concurrency}"
+    )
     latencies = []
     successes = []
     statuses = []
@@ -407,14 +432,21 @@ def http_burst_test(
     started = time.perf_counter_ns()
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = [executor.submit(fetch_url_once, target["url"], timeout, 512 * 1024) for _ in range(requests_count)]
+        completed = 0
+        progress_step = max(1, requests_count // 4)
         for future in concurrent.futures.as_completed(futures):
             outcome = future.result()
+            completed += 1
             successes.append(outcome["ok"])
             if outcome["ok"]:
                 latencies.append(outcome["seconds"] * 1_000)
                 statuses.append(outcome.get("status"))
             else:
                 errors.append(outcome["error"])
+            if completed % progress_step == 0 or completed == requests_count:
+                log_progress(
+                    f"[self] burst progress {target['name']}: {completed}/{requests_count} complete | failures {len(errors)}"
+                )
     elapsed = (time.perf_counter_ns() - started) / 1_000_000_000
     return {
         "target": target,
@@ -428,7 +460,11 @@ def http_burst_test(
     }
 
 
-def stream_download_once(target: dict[str, Any], timeout: float) -> dict[str, Any]:
+def stream_download_once(
+    target: dict[str, Any],
+    timeout: float,
+    progress_label: str | None = None,
+) -> dict[str, Any]:
     max_bytes = target.get("read_bytes")
     request = urllib.request.Request(
         target["url"],
@@ -437,6 +473,7 @@ def stream_download_once(target: dict[str, Any], timeout: float) -> dict[str, An
     bytes_read = 0
     per_second: dict[int, int] = {}
     started = time.perf_counter_ns()
+    last_logged_bucket = -1
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             status = getattr(response, "status", None)
@@ -449,6 +486,10 @@ def stream_download_once(target: dict[str, Any], timeout: float) -> dict[str, An
                 bytes_read += len(chunk)
                 idx = int((time.perf_counter_ns() - started) / 1_000_000_000)
                 per_second[idx] = per_second.get(idx, 0) + len(chunk)
+                if progress_label and idx > last_logged_bucket:
+                    elapsed_s = max((time.perf_counter_ns() - started) / 1_000_000_000, 0.001)
+                    transfer_progress(progress_label, elapsed_s, bytes_read)
+                    last_logged_bucket = idx
                 if max_bytes is not None and bytes_read >= max_bytes:
                     break
         ended = time.perf_counter_ns()
@@ -469,6 +510,9 @@ def parallel_download_test(
     concurrency: int,
     timeout: float,
 ) -> dict[str, Any]:
+    log_progress(
+        f"[self] starting parallel download {target['name']} with {concurrency} streams"
+    )
     start_event = threading.Event()
     results: list[dict[str, Any] | None] = [None] * concurrency
     errors: list[str] = []
@@ -490,16 +534,24 @@ def parallel_download_test(
     wall_end = time.perf_counter_ns()
 
     total_bytes = sum(item["bytes"] for item in results if item)
-    return {
+    outcome = {
         "target": target,
         "concurrency": concurrency,
         "aggregate": summarize_transfer(total_bytes, (wall_end - wall_start) / 1_000_000_000),
         "per_stream": results,
         "errors": errors,
     }
+    log_progress(
+        f"[self] finished parallel download {target['name']}: {fmt_number(outcome['aggregate']['mbps'])} Mbps aggregate"
+    )
+    return outcome
 
 
-def upload_once(target: dict[str, Any], timeout: float) -> dict[str, Any]:
+def upload_once(
+    target: dict[str, Any],
+    timeout: float,
+    progress_label: str | None = None,
+) -> dict[str, Any]:
     parsed = urllib.parse.urlparse(target["url"])
     is_https = parsed.scheme == "https"
     conn_cls = http.client.HTTPSConnection if is_https else http.client.HTTPConnection
@@ -520,6 +572,7 @@ def upload_once(target: dict[str, Any], timeout: float) -> dict[str, Any]:
     payload = b"u" * (64 * 1024)
     sent_total = 0
     started = time.perf_counter_ns()
+    last_logged_bucket = -1
     try:
         conn = conn_cls(host, port, timeout=timeout)
         conn.putrequest(method, path)
@@ -532,6 +585,10 @@ def upload_once(target: dict[str, Any], timeout: float) -> dict[str, Any]:
             sent_total += len(chunk)
             idx = int((time.perf_counter_ns() - started) / 1_000_000_000)
             per_second[idx] = per_second.get(idx, 0) + len(chunk)
+            if progress_label and idx > last_logged_bucket:
+                elapsed_s = max((time.perf_counter_ns() - started) / 1_000_000_000, 0.001)
+                transfer_progress(progress_label, elapsed_s, sent_total)
+                last_logged_bucket = idx
         response = conn.getresponse()
         response.read(1024)
         ended = time.perf_counter_ns()
@@ -622,8 +679,11 @@ def reliability_probe(target: dict[str, Any], timeout: float) -> tuple[bool, flo
 def soak_test(targets: list[dict[str, Any]], duration_s: int, timeout: float) -> list[dict[str, Any]]:
     if not targets:
         return []
+    log_progress(f"[self] starting soak test for {duration_s}s across {len(targets)} targets")
     results = []
     deadline = time.perf_counter() + duration_s
+    started = time.perf_counter()
+    next_progress = started + 5.0
     while time.perf_counter() < deadline:
         for target in targets:
             ok, latency, error = reliability_probe(target, timeout)
@@ -638,6 +698,13 @@ def soak_test(targets: list[dict[str, Any]], duration_s: int, timeout: float) ->
             )
             if time.perf_counter() >= deadline:
                 break
+        now = time.perf_counter()
+        if now >= next_progress:
+            failures = sum(1 for item in results if not item["ok"])
+            log_progress(
+                f"[self] soak progress {int(now - started)}s/{duration_s}s | probes {len(results)} | failures {failures}"
+            )
+            next_progress = now + 5.0
     grouped: dict[str, dict[str, Any]] = {}
     for item in results:
         key = item["target"]
@@ -647,7 +714,7 @@ def soak_test(targets: list[dict[str, Any]], duration_s: int, timeout: float) ->
             entry["latencies"].append(item["latency_ms"])
         elif item["error"]:
             entry["errors"].append(item["error"])
-    return [
+    outcome = [
         {
             "target": key,
             "latency_ms": summarize_samples(value["latencies"]),
@@ -656,6 +723,9 @@ def soak_test(targets: list[dict[str, Any]], duration_s: int, timeout: float) ->
         }
         for key, value in grouped.items()
     ]
+    total_failures = sum(item["reliability"]["failures"] for item in outcome)
+    log_progress(f"[self] finished soak test: total failures {total_failures}")
+    return outcome
 
 
 def background_download_load(
@@ -714,6 +784,7 @@ def under_load_test(
 ) -> dict[str, Any]:
     if not bulk_downloads and not uploads:
         return {"skipped": True, "reason": "no bulk downloads or upload targets configured"}
+    log_progress(f"[self] starting under-load test for {load_seconds}s")
 
     stop_event = threading.Event()
     threads = []
@@ -735,13 +806,18 @@ def under_load_test(
     stop_event.set()
     for thread in threads:
         thread.join(timeout=2.0)
-    return {
+    outcome = {
         "load_seconds": load_seconds,
         "background_download_mbps": sum(download_counters) * 8 / max(load_seconds, 1) / 1_000_000,
         "background_upload_mbps": sum(upload_counters) * 8 / max(load_seconds, 1) / 1_000_000,
         "tcp_connect_under_load": tcp_under_load,
         "http_small_under_load": http_under_load,
     }
+    log_progress(
+        f"[self] finished under-load test: bg down {fmt_number(outcome['background_download_mbps'])} Mbps, "
+        f"bg up {fmt_number(outcome['background_upload_mbps'])} Mbps"
+    )
+    return outcome
 
 
 def flags_from_results(results: dict[str, Any]) -> list[str]:
@@ -870,6 +946,13 @@ def print_summary(results: dict[str, Any]) -> None:
 def run_self_benchmark(args: argparse.Namespace) -> int:
     profile = load_profile(args.config)
     preset = PROFILE_PRESETS[args.profile]
+    log_progress(
+        f"[self] loaded profile '{args.profile}' with "
+        f"{len(profile['dns_hosts'])} DNS hosts, "
+        f"{len(profile['latency_targets'])} latency targets, "
+        f"{len(profile['http_bulk_downloads'])} bulk downloads, "
+        f"{len(profile['http_uploads'])} uploads"
+    )
 
     reliability_targets = profile["reliability_targets"]
     if not reliability_targets:
@@ -897,35 +980,78 @@ def run_self_benchmark(args: argparse.Namespace) -> int:
         "config": profile,
         "tests": {},
     }
+    log_progress("[self] captured system snapshot")
 
+    log_test_start("DNS tests", f"{len(profile['dns_hosts'])} hosts x {preset['dns_repeats']} repeats")
     results["tests"]["dns"] = dns_resolution_test(
         profile["dns_hosts"], preset["dns_repeats"], args.timeout
     )
+    log_test_done("DNS tests", f"{len(results['tests']['dns'])} hosts completed")
+
+    log_test_start("TCP connect tests", f"{len(profile['latency_targets'])} targets x {preset['latency_repeats']} repeats")
     results["tests"]["tcp_connect"] = tcp_connect_test(
         profile["latency_targets"], preset["latency_repeats"], args.timeout
     )
+    log_test_done("TCP connect tests", f"{len(results['tests']['tcp_connect'])} targets completed")
+
+    log_test_start("TLS handshake tests", f"{len(profile['latency_targets'])} targets x {preset['latency_repeats']} repeats")
     results["tests"]["tls_handshake"] = tls_handshake_test(
         profile["latency_targets"], preset["latency_repeats"], args.timeout
     )
+    log_test_done("TLS handshake tests", f"{len(results['tests']['tls_handshake'])} targets completed")
+
+    log_test_start("small HTTP fetch tests", f"{len(profile['http_small_objects'])} targets")
     results["tests"]["http_small"] = small_http_tests(
         profile["http_small_objects"], preset["http_small_repeats"], args.timeout
     )
+    log_test_done("small HTTP fetch tests", f"{len(results['tests']['http_small'])} targets completed")
+
+    log_test_start("HTTP burst tests", f"{len(profile['http_small_objects'])} targets")
     results["tests"]["http_burst"] = [
         http_burst_test(target, preset["http_burst_requests"], preset["http_burst_concurrency"], args.timeout)
         for target in profile["http_small_objects"]
     ]
+    log_test_done("HTTP burst tests", f"{len(results['tests']['http_burst'])} targets completed")
 
     bulk_download_results = []
     for target in profile["http_bulk_downloads"]:
+        log_test_start("bulk download", target["name"])
         bulk_download_results.append(
             {
                 "target": target,
-                "single": stream_download_once(target, args.timeout),
+                "single": stream_download_once(
+                    target,
+                    args.timeout,
+                    progress_label=f"[self] download {target['name']}",
+                ),
                 "parallel": parallel_download_test(target, concurrency=4, timeout=args.timeout),
             }
         )
+        latest = bulk_download_results[-1]
+        log_test_done(
+            "bulk download",
+            f"{target['name']} single {fmt_number(latest['single']['mbps'])} Mbps, "
+            f"parallel {fmt_number(latest['parallel']['aggregate']['mbps'])} Mbps",
+        )
     results["tests"]["bulk_downloads"] = bulk_download_results
-    results["tests"]["uploads"] = upload_tests(profile["http_uploads"], args.timeout)
+
+    upload_results = []
+    for target in profile["http_uploads"]:
+        log_test_start("upload", target["name"])
+        outcome = upload_once(
+            target,
+            args.timeout,
+            progress_label=f"[self] upload {target['name']}",
+        )
+        upload_results.append({"target": target, **outcome})
+        log_test_done(
+            "upload",
+            f"{target['name']} status {upload_results[-1].get('status', '-')}, "
+            f"{fmt_number(upload_results[-1].get('mbps'))} Mbps",
+        )
+    results["tests"]["uploads"] = upload_results
+
+    log_test_start("under-load test", f"{args.load_seconds or preset['load_seconds']}s")
     results["tests"]["under_load"] = under_load_test(
         profile["latency_targets"],
         profile["http_small_objects"],
@@ -934,16 +1060,33 @@ def run_self_benchmark(args: argparse.Namespace) -> int:
         timeout=args.timeout,
         load_seconds=args.load_seconds or preset["load_seconds"],
     )
+    if results["tests"]["under_load"].get("skipped"):
+        log_test_done("under-load test", "skipped")
+    else:
+        log_test_done(
+            "under-load test",
+            f"bg down {fmt_number(results['tests']['under_load']['background_download_mbps'])} Mbps, "
+            f"bg up {fmt_number(results['tests']['under_load']['background_upload_mbps'])} Mbps",
+        )
+
+    log_test_start("ICMP tests")
     results["tests"]["icmp"] = [
         icmp_ping(target["host"], count=6, interval=0.2, timeout=args.timeout)
         for target in profile["latency_targets"][:2]
     ]
+    log_test_done("ICMP tests", f"{len(results['tests']['icmp'])} targets completed")
+
+    log_test_start("PMTU tests")
     results["tests"]["pmtu"] = [pmtu_probe(target["host"], timeout=args.timeout) for target in profile["latency_targets"][:2]]
+    log_test_done("PMTU tests", f"{len(results['tests']['pmtu'])} targets completed")
+
+    log_test_start("soak test", f"{args.soak_seconds or preset['soak_seconds']}s")
     results["tests"]["soak"] = soak_test(
         reliability_targets,
         duration_s=args.soak_seconds or preset["soak_seconds"],
         timeout=args.timeout,
     )
+    log_test_done("soak test", f"{len(results['tests']['soak'])} targets summarized")
     results["analysis_flags"] = flags_from_results(results)
 
     print_summary(results)
